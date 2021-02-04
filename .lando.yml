@@ -1,0 +1,6 @@
+name: lightzoneproject
+recipe: drupal7
+config:
+  webroot: .
+  php: 7.4
+  drush: 8.3.3
