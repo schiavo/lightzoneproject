@@ -8,7 +8,7 @@
 /**
  * The current system version.
  */
-define('VERSION', '7.56');
+define('VERSION', '7.78');
 
 /**
  * Core API compatibility.
@@ -704,6 +704,19 @@ function drupal_environment_initialize() {
   // Set sane locale settings, to ensure consistent string, dates, times and
   // numbers handling.
   setlocale(LC_ALL, 'C');
+
+  // PHP's built-in phar:// stream wrapper is not sufficiently secure. Override
+  // it with a more secure one, which requires PHP 5.3.3. For lower versions,
+  // unregister the built-in one without replacing it. Sites needing phar
+  // support for lower PHP versions must implement hook_stream_wrappers() to
+  // register their desired implementation.
+  if (in_array('phar', stream_get_wrappers(), TRUE)) {
+    stream_wrapper_unregister('phar');
+    if (version_compare(PHP_VERSION, '5.3.3', '>=')) {
+      include_once DRUPAL_ROOT . '/includes/file.phar.inc';
+      file_register_phar_wrapper();
+    }
+  }
 }
 
 /**
@@ -1176,19 +1189,21 @@ function variable_initialize($conf = array()) {
     $variables = $cached->data;
   }
   else {
-    // Cache miss. Avoid a stampede.
+    // Cache miss. Avoid a stampede by acquiring a lock. If the lock fails to
+    // acquire, optionally just continue with uncached processing.
     $name = 'variable_init';
-    if (!lock_acquire($name, 1)) {
-      // Another request is building the variable cache.
-      // Wait, then re-run this function.
+    $lock_acquired = lock_acquire($name, 1);
+    if (!$lock_acquired && variable_get('variable_initialize_wait_for_lock', FALSE)) {
       lock_wait($name);
       return variable_initialize($conf);
     }
     else {
-      // Proceed with variable rebuild.
+      // Load the variables from the table.
       $variables = array_map('unserialize', db_query('SELECT name, value FROM {variable}')->fetchAllKeyed());
-      cache_set('variables', $variables, 'cache_bootstrap');
-      lock_release($name);
+      if ($lock_acquired) {
+        cache_set('variables', $variables, 'cache_bootstrap');
+        lock_release($name);
+      }
     }
   }
 
@@ -1985,7 +2000,7 @@ function watchdog($type, $message, $variables = array(), $severity = WATCHDOG_NO
 
   // It is possible that the error handling will itself trigger an error. In that case, we could
   // end up in an infinite loop. To avoid that, we implement a simple static semaphore.
-  if (!$in_error_state && function_exists('module_implements')) {
+  if (!$in_error_state && function_exists('module_invoke_all')) {
     $in_error_state = TRUE;
 
     // The user object may not exist in all conditions, so 0 is substituted if needed.
@@ -2008,9 +2023,7 @@ function watchdog($type, $message, $variables = array(), $severity = WATCHDOG_NO
     );
 
     // Call the logging hooks to log/process the message
-    foreach (module_implements('watchdog') as $module) {
-      module_invoke($module, 'watchdog', $log_entry);
-    }
+    module_invoke_all('watchdog', $log_entry);
 
     // It is critical that the semaphore is only cleared here, in the parent
     // watchdog() call (not outside the loop), to prevent recursive execution.
@@ -2505,6 +2518,7 @@ function drupal_bootstrap($phase = NULL, $new_phase = TRUE) {
 
       switch ($current_phase) {
         case DRUPAL_BOOTSTRAP_CONFIGURATION:
+          require_once DRUPAL_ROOT . '/includes/request-sanitizer.inc';
           _drupal_bootstrap_configuration();
           break;
 
@@ -2609,6 +2623,10 @@ function _drupal_exception_handler($exception) {
     _drupal_log_error(_drupal_decode_exception($exception), TRUE);
   }
   catch (Exception $exception2) {
+    // Add a 500 status code in case an exception was thrown before the 500
+    // status could be set (e.g. while loading a maintenance theme from cache).
+    drupal_add_http_header('Status', '500 Internal Server Error');
+
     // Another uncaught exception was thrown while handling the first one.
     // If we are displaying errors, then do so with no possibility of a further uncaught exception being thrown.
     if (error_displayable()) {
@@ -2634,8 +2652,7 @@ function _drupal_bootstrap_configuration() {
   drupal_settings_initialize();
 
   // Sanitize unsafe keys from the request.
-  require_once DRUPAL_ROOT . '/includes/request-sanitizer.inc';
-  DrupalRequestSanitizer::sanitize();  
+  DrupalRequestSanitizer::sanitize();
 }
 
 /**
@@ -2901,7 +2918,7 @@ function drupal_fast_404() {
     $fast_paths = variable_get('404_fast_paths', FALSE);
     if ($fast_paths && preg_match($fast_paths, $_GET['q'])) {
       drupal_add_http_header('Status', '404 Not Found');
-      $fast_404_html = variable_get('404_fast_html', '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML+RDFa 1.0//EN" "http://www.w3.org/MarkUp/DTD/xhtml-rdfa-1.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html; charset=gb18030"><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested URL "@path" was not found on this server.</p></body></html>');
+      $fast_404_html = variable_get('404_fast_html', '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML+RDFa 1.0//EN" "http://www.w3.org/MarkUp/DTD/xhtml-rdfa-1.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested URL "@path" was not found on this server.</p></body></html>');
       // Replace @path in the variable with the page path.
       print strtr($fast_404_html, array('@path' => check_plain(request_uri())));
       exit;
@@ -3785,8 +3802,12 @@ function _drupal_shutdown_function() {
   chdir(DRUPAL_ROOT);
 
   try {
-    while (list($key, $callback) = each($callbacks)) {
+    // Manually iterate over the array instead of using a foreach loop.
+    // A foreach operates on a copy of the array, so any shutdown functions that
+    // were added from other shutdown functions would never be called.
+    while ($callback = current($callbacks)) {
       call_user_func_array($callback['callback'], $callback['arguments']);
+      next($callbacks);
     }
   }
   catch (Exception $exception) {
