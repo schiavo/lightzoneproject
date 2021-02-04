@@ -3,7 +3,9 @@
 To run the site locally.
 
 git clone <remote repo url>
-cd lightzoneproject 
+
+cd lightzoneproject
+
 lando start
 
 You might have to update database connection in settings.php
